@@ -15,6 +15,10 @@ import orange.serialization.archives.Archive;
 import orange.util._;
 import orange.util.collection.Array;
 
+enum _MaxSerializedVoidArray = 1000;
+enum _filenameKey = "___filename___";
+enum _inlineArrayKey = "___inlineArray___";
+
 private
 {
     alias orange.util.CTFE.contains ctfeContains;
@@ -837,21 +841,69 @@ class Serializer
             addSerializedArray(array, id);
     }
 
-    private void serializeArray (T) (ref T value, string key, Id id)
-    {
-        auto array = Array(value.ptr, value.length, ElementTypeOfArray!(T).sizeof);
 
-        archive.archiveArray(array, arrayToString!(T), key, id, {
-            for (size_t i = 0; i < value.length; i++)
-            {
-                const e = value[i];
-                serializeInternal(e, toData(i));
-            }
-        });
 
-        if (value.length > 0)
-            addSerializedArray(array, id);
-    }
+
+
+
+
+
+
+
+
+
+	private void serializeArray (T) (ref T value, string key, Id id)
+	{
+		alias ElementTypeOfArray!(T) E;
+        alias Unqual!(E) UnqualfiedE;
+
+		auto array = Array(value.ptr, value.length, ElementTypeOfArray!(T).sizeof);
+
+		archive.archiveArray(array, arrayToString!(T), key, id,
+				{
+					static if (!(is(UnqualfiedE == void) || is(isScalarType!UnqualfiedE)))
+					{
+						for (size_t i = 0; i < value.length; i++)
+						{
+							const e = value[i];
+							serializeInternal(e, toData(i));
+						}
+					} else
+					{
+						import std.stdio, std.file, std.base64, std.conv;
+						if (value == null || value.length == 0)	return;
+
+						if (value.length < _MaxSerializedVoidArray)
+						{
+
+							auto result = appender!string();
+							Base64.encode(cast(byte[])value, result);
+							auto res = result.data;
+							serializeInternal(res, _inlineArrayKey);
+						} else
+						{
+							auto filename = to!string(id)~"_"~to!string(hashOf(key~to!string(id)),16)~".xmldat";
+							if (exists(filename)) remove(filename);
+							serializeInternal(filename, _filenameKey);
+							std.file.write(filename, value);
+						}
+
+					}
+				});
+		if (value.length > 0) addSerializedArray(array, id);
+
+	}
+
+
+
+
+
+
+
+
+
+
+
 
     private void serializeAssociativeArray (T) (T value, string key, Id id)
     {
@@ -1306,39 +1358,69 @@ class Serializer
 
         alias ElementTypeOfArray!(T) E;
         alias Unqual!(E) UnqualfiedE;
+		T value;
+		UnqualfiedE[] buffer;
 
-        UnqualfiedE[] buffer;
-        T value;
+		import std.stdio, std.file, std.base64, std.conv;
 
-        auto dg = (size_t length) {
-            buffer.length = length;
+		// Called to serialize array elements
+		auto dg = (size_t length)
+				{
+					static if (!(is(UnqualfiedE == void) || is(isScalarType!UnqualfiedE)))
+					{
+						buffer.length = length;
+						foreach (i, ref e ; buffer)
+							e = deserializeInternal!(typeof(e))(toData(i));
+					}
+					else
+					{
+						if (length < _MaxSerializedVoidArray)
+						{
+							try
+							{
+								string data = deserializeInternal!(string)(_inlineArrayKey);
+								buffer = cast(UnqualfiedE[])Base64.decode(data);
+							} catch
+							{
+								buffer.length = 0;
+							}
 
-            foreach (i, ref e ; buffer)
-                e = deserializeInternal!(typeof(e))(toData(i));
-        };
+						} else
+						{
+							// Load data from file
+							auto filename = deserializeInternal!(string)(_filenameKey);
 
-        if (slice.id != size_t.max) // Deserialize slice
-        {
-            id = slice.id;
-            archive.unarchiveArray(slice.id, dg);
-            assumeUnique(buffer, value);
-            addDeserializedSlice(value, slice.id);
+							auto id = slice.id;
+							if (!exists(filename)) assert("xml data not found for `"~filename~"`!");
+							if (getSize(filename) != length) assert("xml data not correct size for `"~filename~"`! Expected "~to!string(value.length)~" got "~to!string(getSize(filename))~".");
 
-            return toSlice(value, slice);
-        }
+							buffer = cast(UnqualfiedE[])std.file.read(filename);
+						}
+					}
+				};
 
-        else // Deserialize array
-        {
-            id = archive.unarchiveArray(key, dg);
+		if (slice.id != size_t.max) // Deserialize slice
+		{
+			id = slice.id;
+			archive.unarchiveArray(slice.id, dg);
+			assumeUnique(buffer, value);
+			addDeserializedSlice(value, slice.id);
 
-            if (auto arr = id in deserializedSlices)
-                return cast(T) *arr;
+			return toSlice(value, slice);
+		}
+		else // Deserialize array
+		{
+			id = archive.unarchiveArray(key, dg);
 
-            assumeUnique(buffer, value);
-            addDeserializedSlice(value, id);
+			if (auto arr = id in deserializedSlices)
+				return cast(T) *arr;
 
-            return value;
-        }
+			assumeUnique(buffer, value);
+			addDeserializedSlice(value, id);
+
+			return value;
+		}
+
     }
 
     private T deserializeStaticArray (T) (string key, out Id id)
